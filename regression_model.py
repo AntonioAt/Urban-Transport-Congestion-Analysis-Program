@@ -1,6 +1,7 @@
 """
 Regression modeling module for urban transport analysis.
-Builds and evaluates predictive models for traffic congestion.
+Builds predictive models for traffic congestion while actively 
+diagnosing and mitigating multicollinearity.
 """
 
 import pandas as pd
@@ -10,9 +11,33 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from typing import Dict, List, Tuple, Optional
 import warnings
+
 warnings.filterwarnings('ignore')
+
+
+def calculate_vif(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+    """
+    Calculate Variance Inflation Factor (VIF) to detect multicollinearity.
+    VIF values > 5 indicate problematic collinearity.
+    """
+    X = df[features].dropna()
+    
+    # Add constant for the statsmodels VIF calculation
+    X_with_const = sm.add_constant(X)
+    
+    vif_data = pd.DataFrame()
+    vif_data["Feature"] = X_with_const.columns
+    vif_data["VIF"] = [
+        variance_inflation_factor(X_with_const.values, i) 
+        for i in range(X_with_const.shape[1])
+    ]
+    
+    # Exclude the constant row from the final output
+    return vif_data[vif_data["Feature"] != "const"].round(2)
 
 
 class CongestionPredictor:
@@ -35,13 +60,15 @@ class CongestionPredictor:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare feature matrix and target vector.
+        Defaults to ratio-based features to mitigate multicollinearity.
         """
         if features is None:
-            # Default features for the model
+            # CRITICAL FIX: Replaced absolute values (Vehicle_Count, Population) 
+            # with per-capita ratios to resolve severe multicollinearity.
             potential_features = [
-                'Vehicle_Count', 'Population', 'Public_Transport_Capacity',
-                'Public_Transport_Fleet', 'Vehicles_Per_Capita',
-                'Transport_Capacity_Per_Capita', 'Vehicle_Transport_Ratio'
+                'Vehicles_Per_Capita',
+                'Transport_Capacity_Per_Capita',
+                'Vehicle_Transport_Ratio'
             ]
             features = [f for f in potential_features if f in df.columns]
         
@@ -65,7 +92,6 @@ class CongestionPredictor:
         """
         Train multiple regression models and evaluate their performance.
         """
-        # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state
         )
@@ -87,15 +113,16 @@ class CongestionPredictor:
         best_r2 = -np.inf
         
         for name, model in model_configs.items():
-            # Train
             if 'Regression' in name:
                 model.fit(X_train_scaled, y_train)
                 y_pred = model.predict(X_test_scaled)
                 y_train_pred = model.predict(X_train_scaled)
+                cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=min(5, len(X_train)), scoring='r2')
             else:
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_test)
                 y_train_pred = model.predict(X_train)
+                cv_scores = cross_val_score(model, X_train, y_train, cv=min(5, len(X_train)), scoring='r2')
             
             # Evaluate
             train_r2 = r2_score(y_train, y_train_pred)
@@ -103,12 +130,6 @@ class CongestionPredictor:
             mse = mean_squared_error(y_test, y_pred)
             rmse = np.sqrt(mse)
             mae = mean_absolute_error(y_test, y_pred)
-            
-            # Cross-validation (on scaled data for linear models)
-            if 'Regression' in name:
-                cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=min(5, len(X_train)), scoring='r2')
-            else:
-                cv_scores = cross_val_score(model, X_train, y_train, cv=min(5, len(X_train)), scoring='r2')
             
             results[name] = {
                 'model': model,
@@ -131,13 +152,12 @@ class CongestionPredictor:
     
     def get_feature_importance(self) -> pd.DataFrame:
         """
-        Get feature importance from the best model.
+        Extract feature importance from the trained models.
         """
         importances = []
         
         for name, model in self.models.items():
             if hasattr(model, 'feature_importances_'):
-                # Tree-based models
                 imp = pd.DataFrame({
                     'Feature': self.feature_names,
                     'Importance': model.feature_importances_,
@@ -145,7 +165,6 @@ class CongestionPredictor:
                 })
                 importances.append(imp)
             elif hasattr(model, 'coef_'):
-                # Linear models
                 imp = pd.DataFrame({
                     'Feature': self.feature_names,
                     'Importance': np.abs(model.coef_),
@@ -158,9 +177,6 @@ class CongestionPredictor:
         return pd.DataFrame()
     
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        Make predictions using the best model.
-        """
         if self.best_model is None:
             raise ValueError("No model trained yet. Call train_models first.")
         
@@ -170,9 +186,6 @@ class CongestionPredictor:
         return self.best_model.predict(X)
     
     def get_linear_equation(self) -> str:
-        """
-        Get the equation for the linear regression model.
-        """
         if 'Linear Regression' not in self.models:
             return "Linear regression model not trained."
         
@@ -183,8 +196,7 @@ class CongestionPredictor:
             sign = "+" if coef >= 0 else "-"
             terms.append(f"{sign} {abs(coef):.6f} × {feature}")
         
-        equation = "Traffic_Index = " + " ".join(terms)
-        return equation
+        return "Traffic_Index = " + " ".join(terms)
 
 
 def build_congestion_model(
@@ -194,22 +206,26 @@ def build_congestion_model(
     verbose: bool = True
 ) -> Tuple[CongestionPredictor, Dict, pd.DataFrame]:
     """
-    Main function to build and evaluate congestion prediction models.
-    
-    Returns:
-        Tuple of (predictor, results, feature_importance)
+    Main orchestration function to build, evaluate, and diagnose models.
     """
     predictor = CongestionPredictor()
     
-    # Prepare data
     X, y = predictor.prepare_features(df, target, features)
     
     if verbose:
-        print(f"\n=== Regression Modeling ===")
-        print(f"Features: {predictor.feature_names}")
+        print("\n=== Regression Modeling & Diagnostics ===")
+        print(f"Engineered Features: {predictor.feature_names}")
         print(f"Samples: {len(X)}")
+        
+        # Run VIF Diagnostic
+        print("\n--- Multicollinearity Diagnostic (VIF) ---")
+        vif_df = calculate_vif(df, predictor.feature_names)
+        print(vif_df.to_string(index=False))
+        if any(vif_df['VIF'] > 5):
+            print("WARNING: High multicollinearity detected (VIF > 5). Consider further feature engineering.")
+        else:
+            print("STATUS: VIF values are within acceptable limits. Features are well-isolated.")
     
-    # Train models
     results = predictor.train_models(X, y)
     
     if verbose:
@@ -221,10 +237,8 @@ def build_congestion_model(
                   f"{metrics['rmse']:<12} {metrics['cv_mean']:<12}")
         
         print(f"\nBest Model: {predictor.best_model_name}")
-        print(f"\nLinear Regression Equation:")
-        print(predictor.get_linear_equation())
+        print(f"\nLinear Equation:\n{predictor.get_linear_equation()}")
     
-    # Get feature importance
     feature_importance = predictor.get_feature_importance()
     
     return predictor, results, feature_importance
@@ -232,7 +246,7 @@ def build_congestion_model(
 
 def interpret_coefficients(predictor: CongestionPredictor) -> List[str]:
     """
-    Generate interpretations of the linear regression coefficients.
+    Interpret the standardized coefficients of the Linear Regression model.
     """
     if 'Linear Regression' not in predictor.models:
         return ["Linear regression model not available."]
@@ -241,20 +255,10 @@ def interpret_coefficients(predictor: CongestionPredictor) -> List[str]:
     interpretations = []
     
     for feature, coef in zip(predictor.feature_names, model.coef_):
-        if 'Vehicle' in feature and coef > 0:
-            interpretations.append(
-                f"Increasing {feature} is associated with higher congestion "
-                f"(+{coef:.6f} Traffic Index points per unit increase)."
-            )
-        elif 'Transport' in feature and coef < 0:
-            interpretations.append(
-                f"Increasing {feature} is associated with lower congestion "
-                f"({coef:.6f} Traffic Index points per unit increase)."
-            )
-        elif 'Capacity' in feature:
-            direction = "reduces" if coef < 0 else "increases"
-            interpretations.append(
-                f"Each unit increase in {feature} {direction} the Traffic Index by {abs(coef):.6f} points."
-            )
+        impact = "increases" if coef > 0 else "decreases"
+        interpretations.append(
+            f"A one standard deviation increase in {feature} {impact} the "
+            f"Traffic Index by {abs(coef):.2f} points."
+        )
     
     return interpretations
